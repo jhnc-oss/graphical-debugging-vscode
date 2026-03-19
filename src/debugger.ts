@@ -205,7 +205,8 @@ export class Debugger {
     async unrollTypeAlias(type: string): Promise<string> {
         const debuggerName = this.sessionInfo?.debugger;
         if (debuggerName === 'gdb') {
-            const evalResult = (await this.evaluate("-exec ptype /rmt '" + type + "'"))?.result;
+            const typeEscaped = type.replace('(anonymous namespace)', "'(anonymous namespace)'");
+            const evalResult = (await this.evaluate('-exec ptype /rmt ' + typeEscaped))?.result;
             let typeInfo: string = typeof evalResult === 'string' ? evalResult.trim() : '';
             if (typeInfo.startsWith('type = ')) {
                 // console.log(typeInfo);
