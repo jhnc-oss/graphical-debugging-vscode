@@ -250,7 +250,9 @@ export class Container {
         return undefined;
     }
     async *elements(dbg: debug.Debugger, variable: Variable): AsyncGenerator<string, void, unknown> {}    
-    async *elementsMem(dbg: debug.Debugger, variable: Variable): AsyncGenerator<Buffer, void, unknown> {}
+    async *elementsHybrid(dbg: debug.Debugger, variable: Variable): AsyncGenerator<Buffer, void, unknown> {}
+    async *elementsMem(dbg: debug.Debugger, buffer: Buffer): AsyncGenerator<Buffer, void, unknown> {}
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> { return false; }
 }
 
 export class RandomAccessContainer extends Container {}
@@ -280,7 +282,7 @@ export class ContiguousArray extends ContiguousContainer
         }
     }
 
-    async *elementsMem(dbg: debug.Debugger, variable: Variable): AsyncGenerator<Buffer, void, unknown> {
+    async *elementsHybrid(dbg: debug.Debugger, variable: Variable): AsyncGenerator<Buffer, void, unknown> {
         let size = await this.size(dbg, variable);
         let elStr = this.element(variable);
         let elSizeOf = (elStr ? await dbg.sizeOf(elStr) : 0) ?? 0;
@@ -301,6 +303,65 @@ export class ContiguousArray extends ContiguousContainer
     }
 
     protected async size(dbg: debug.Debugger, variable: Variable): Promise<number> { return 0; }
+
+    protected async *elementsMemCA(dbg: debug.Debugger, buffer: Buffer, size: number): AsyncGenerator<Buffer, void, unknown> {
+        if (this._memoryCA === undefined)
+            return;
+        const byteSize = size * this._memoryCA.elemSizeOf;
+        let elemsBuffer: Buffer | undefined = undefined;
+        if (this._memoryCA.startReader instanceof debug.PointerReader) {
+            const start = this._memoryCA.startReader.read(buffer, this._memoryCA.startOffset);
+            if (start === undefined)
+                return;
+            const startStr = "0x" + start.toString(16);
+            elemsBuffer = await dbg.readMemoryBuffer(startStr, 0, byteSize);
+            if (elemsBuffer === undefined)
+                return;
+        }
+        // This may not be correct for all languages
+        else if (dbg.language() === debug.Language.Cpp) {
+            elemsBuffer = buffer.slice(this._memoryCA.startOffset, this._memoryCA.startOffset + byteSize);
+        }
+        else {
+            return;
+        }
+        for (let i = 0 ; i < size ; ++i) {
+            yield elemsBuffer.slice(i * this._memoryCA.elemSizeOf, i * this._memoryCA.elemSizeOf + this._memoryCA.elemSizeOf);
+        }
+    }
+
+    protected async initMemCA(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        this._memoryCA = undefined;
+        const startStr = this._start.toString(variable);
+        let startReader: debug.PointerReader | number | undefined = undefined;
+        startReader = await debug.pointerReader(dbg, startStr);
+        if (startReader === undefined) {
+            
+            const type = await dbg.getType(startStr);
+            if (type !== undefined && dbg.isArray(type))
+                startReader = 0; // TODO: change, use number as dummy type for now
+        }
+        if (startReader === undefined)
+            return false;
+        const sizeOf = await dbg.sizeOf(variable.name);
+        if (sizeOf === undefined)
+            return false;
+        const startOffset = await dbg.addressOffset(variable.name, startStr);
+        if (startOffset === undefined)
+            return false;
+        if (startOffset >= sizeOf)
+            return false;
+        const elemStr = this.element(variable);
+        if (elemStr === undefined)
+            return false;
+        const elemSizeOf = await dbg.sizeOf(elemStr);
+        if (elemSizeOf === undefined)
+            return false;
+        this._memoryCA = {startReader, startOffset: new Number(startOffset).valueOf(), sizeOf, elemSizeOf};
+        return true;
+    }
+    
+    protected _memoryCA: {startReader: debug.PointerReader | number; startOffset: number; sizeOf: number, elemSizeOf: number} | undefined = undefined;
 }
 
 // Static array
@@ -312,10 +373,59 @@ export class Array extends ContiguousArray {
 
     protected async size(dbg: debug.Debugger, variable: Variable): Promise<number> {
         const sizeStr = this._size.toString(variable);
-        // TODO: Check if it's possible to parse size at this point
-        const sizeVal = await dbg.getValue(sizeStr);
-        return sizeVal !== undefined ? parseInt(sizeVal) : 0;
+        const sizeNum = Number(sizeStr); // Size can be compile-time constant
+        if (!Number.isNaN(sizeNum)) {
+            return sizeNum.valueOf();
+        }
+        const size = await dbg.getValue(sizeStr);
+        return size !== undefined ? parseInt(size) : 0;
     }
+
+    async *elementsMem(dbg: debug.Debugger, buffer: Buffer): AsyncGenerator<Buffer, void, unknown> {
+        if (this._memory === undefined)
+            return;
+        let size: number | undefined = undefined;
+        if (this._memory.sizeReader instanceof debug.NumericReader) {
+            size = this._memory.sizeReader.read(buffer, this._memory.sizeOffset);
+            if (size === undefined)
+                return;
+        }
+        else {
+            // The assumption is that compile-time size is the same when initMem is called as when elementsMem
+            size = this._memory.sizeReader;
+        }
+
+        // TODO: would it be possible to handle this without await?
+        for await (let elBuf of super.elementsMemCA(dbg, buffer, size)) {
+            yield elBuf;
+        }
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        if (! await super.initMemCA(dbg, variable))
+            return false;
+        if (this._memoryCA === undefined)
+            return false;
+        const sizeStr = this._size.toString(variable);
+        // Size can be compile-time constant
+        const sizeNum = Number(sizeStr)
+        const sizeReader = !Number.isNaN(sizeNum)
+                         ? sizeNum.valueOf()
+                         : await debug.numericReader(dbg, sizeStr);
+        if (sizeReader === undefined)
+            return false;
+        const sizeOffset = sizeReader instanceof debug.NumericReader
+                         ? await dbg.addressOffset(variable.name, sizeStr)
+                         : 0;
+        if (sizeOffset === undefined)
+            return false;
+        if (sizeOffset >= this._memoryCA.sizeOf)
+            return false;
+        this._memory = {sizeReader, sizeOffset: new Number(sizeOffset).valueOf()};
+        return true;
+    }
+
+    private _memory: {sizeReader: debug.NumericReader | number; sizeOffset: number;} | undefined = undefined;
 }
 
 // Dynamic array
@@ -330,6 +440,65 @@ export class DArray extends ContiguousArray {
         const sizeVal = await dbg.getValue(sizeStr);
         return sizeVal !== undefined ? parseInt(sizeVal) : 0;
     }
+
+    // TODO: use elementsMemCA and initMemCA
+
+    async *elementsMem(dbg: debug.Debugger, buffer: Buffer): AsyncGenerator<Buffer, void, unknown> {
+        if (this._memory === undefined)
+            return;
+        const start = this._memory.startReader.read(buffer, this._memory.startOffset);
+        if (start === undefined)
+            return;
+        const finish = this._memory.finishReader.read(buffer, this._memory.finishOffset);
+        if (finish === undefined)
+            return;
+        const byteSize = (finish - start);
+        const elemSizeOf = BigInt(this._memory.elemSizeOf);
+        if (byteSize % elemSizeOf !== BigInt(0))
+            return;
+        const size = new Number(byteSize / elemSizeOf).valueOf();
+        const startStr = "0x" + start.toString(16);
+        const elemsBuffer = await dbg.readMemoryBuffer(startStr, 0, new Number(byteSize).valueOf());
+        if (elemsBuffer === undefined) {
+            return;
+        }
+        for (let i = 0 ; i < size ; ++i) {
+            yield elemsBuffer.slice(i * this._memory.elemSizeOf, i * this._memory.elemSizeOf + this._memory.elemSizeOf);
+        }
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        this._memory = undefined;
+        const startStr = this._start.toString(variable);
+        const finishStr = this._finish.toString(variable);
+        const startReader = await debug.pointerReader(dbg, startStr);
+        if (startReader === undefined)
+            return false;
+        const finishReader = await debug.pointerReader(dbg, finishStr);
+        if (finishReader === undefined)
+            return false;
+        const sizeOf = await dbg.sizeOf(variable.name);
+        if (sizeOf === undefined)
+            return false;
+        const startOffset = await dbg.addressOffset(variable.name, startStr);
+        if (startOffset === undefined)
+            return false;
+        const finishOffset = await dbg.addressOffset(variable.name, finishStr);
+        if (finishOffset === undefined)
+            return false;
+        if (startOffset >= sizeOf || finishOffset >= sizeOf)
+            return false;
+        const elemStr = this.element(variable);
+        if (elemStr === undefined)
+            return false;
+        const elemSizeOf = await dbg.sizeOf(elemStr);
+        if (elemSizeOf === undefined)
+            return false;
+        this._memory = {startReader, finishReader, startOffset: new Number(startOffset).valueOf(), finishOffset: new Number(finishOffset).valueOf(), elemSizeOf};
+        return true;
+    }
+
+    private _memory: {startReader: debug.PointerReader; finishReader: debug.PointerReader; startOffset: number; finishOffset: number; elemSizeOf: number} | undefined = undefined;
 }
 
 // Indexable/subscriptable array
@@ -421,6 +590,32 @@ export class Value {
         const valVal = await dbg.getValue(valStr);
         return valVal !== undefined ? parseFloat(valVal) : undefined;
     }
+
+    async loadMem(buffer: Buffer): Promise<number | undefined> {
+        return this._memory?.numericReader.read(buffer, this._memory.valueOffset);
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        this._memory = undefined;
+        const sizeOf = await dbg.sizeOf(variable.name);
+        if (sizeOf === undefined)
+            return false;
+        const valName = this._name.toString(variable);
+        if (valName === undefined)
+            return false;
+        const offset = await dbg.addressOffset(variable.name, valName);
+        if (offset === undefined)
+            return false;
+        if (offset < 0 || offset >= sizeOf)
+            return false;
+        const numericReader = await debug.numericReader(dbg, valName);
+        if (numericReader === undefined)
+            return false;
+        this._memory = {sizeOf, valueOffset: Number(offset).valueOf(), numericReader};
+        return true;
+    }    
+
+    private _memory: {sizeOf: number; valueOffset: number; numericReader: debug.NumericReader;} | undefined = undefined;
 }
 
 // Base Loader
@@ -428,6 +623,12 @@ export class Value {
 export class Loader {
     async load(dbg: debug.Debugger, variable: Variable): Promise<draw.Drawable | undefined> {
         return undefined;
+    }
+    async loadMem(dbg: debug.Debugger, buffer: Buffer): Promise<draw.Drawable | undefined> {
+        return undefined;
+    }
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        return false;
     }
 }
 
@@ -441,12 +642,23 @@ export class Numbers extends ContainerLoader {
     }
     async load(dbg: debug.Debugger, variable: Variable): Promise<draw.Drawable | undefined> {
         let ys: number[] = [];
+
+        // TEST vvv
+        const addrStr = await dbg.addressStr(variable.name);
+        const sizeOf = await dbg.sizeOf(variable.name);
+        if (addrStr && sizeOf) {
+            const buffer = await dbg.readMemoryBuffer(addrStr, 0, sizeOf);
+            if (buffer) {
+                const test = await this.loadMem(dbg, buffer);
+                const aaa = 10;
+            }
+        }
+        // TEST ^^^
+
         // Memory read
-        // TODO: there is no need to create numericReader if container doesn't support memory read
-        const reader = await this.numericReader(dbg, variable);
-        if (reader !== undefined) {
-            for await (let elBuf of this._container.elementsMem(dbg, variable)) {
-                const el = reader.read(elBuf);
+        if (this._memory !== undefined) {
+            for await (let elBuf of this._container.elementsHybrid(dbg, variable)) {
+                const el = this._memory.numericReader.read(elBuf);
                 if (el !== undefined) {
                     ys.push(el);
                 }
@@ -467,17 +679,33 @@ export class Numbers extends ContainerLoader {
         return new draw.Plot(util.indexesArray(ys), ys, draw.System.None);
     }
 
-    private async numericReader(dbg: debug.Debugger, variable: Variable) {
-        if (this._numericReader === undefined) {
-            const el = this._container.element(variable);
+    async loadMem(dbg: debug.Debugger, buffer: Buffer): Promise<draw.Drawable | undefined> {
+        if (this._memory === undefined)
+            return undefined;
+        let ys: number[] = [];        
+        for await (let elBuf of this._container.elementsMem(dbg, buffer)) {
+            const el = this._memory.numericReader.read(elBuf);
             if (el !== undefined) {
-                this._numericReader = await debug.numericReader(dbg, el);
+                ys.push(el);
             }
         }
-        return this._numericReader;
+        return new draw.Plot(util.indexesArray(ys), ys, draw.System.None);
     }
 
-    private _numericReader: debug.NumericReader | undefined = undefined;
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        this._memory = undefined;
+        const el = this._container.element(variable);
+        if (el === undefined)
+            return false;
+        const numericReader = await debug.numericReader(dbg, el);
+        if (numericReader === undefined)
+            return false;
+        await this._container.initMem(dbg, variable);
+        this._memory = {numericReader};
+        return true;
+    }
+
+    private _memory: {numericReader: debug.NumericReader;} | undefined = undefined;
 }
 
 export class Values extends ContainerLoader {
@@ -486,14 +714,40 @@ export class Values extends ContainerLoader {
     }
     async load(dbg: debug.Debugger, variable: Variable): Promise<draw.Drawable | undefined> {
         let ys: number[] = [];
-        for await (let elStr of this._container.elements(dbg, variable)) {
-            const v = new Variable(elStr, this._valueType);
-            const n = await this._value.load(dbg, v);
-            if (n === undefined)
-                return undefined
-            ys.push(n);
+        // Memory read
+        if (true) { // TODO: some check of value and container
+            for await (let elBuf of this._container.elementsHybrid(dbg, variable)) {
+                const el = await this._value.loadMem(elBuf);
+                if (el !== undefined) {
+                    ys.push(el);
+                }
+            }
+        }
+        // TODO: should probably check real error
+        if (ys.length == 0)
+        {
+            for await (let elStr of this._container.elements(dbg, variable)) {
+                const v = new Variable(elStr, this._valueType);
+                const n = await this._value.load(dbg, v);
+                if (n === undefined)
+                    return undefined
+                ys.push(n);
+            }
         }
         return new draw.Plot(util.indexesArray(ys), ys, draw.System.None);
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        const elStr = this._container.element(variable);
+        if (elStr === undefined)
+            return false;
+
+        // TODO - this is optional
+        await this._container.initMem(dbg, variable);
+
+        const v = new Variable(elStr, this._valueType);
+        // TODO: check result of value's initMem before container initMem call?
+        return this._value.initMem(dbg, v); // TODO - is returning Promise ok?
     }
 }
 
@@ -505,17 +759,46 @@ export class Points extends ContainerLoader {
         let xs: number[] = [];
         let ys: number[] = [];
         let system = draw.System.None;
-        for await (let elStr of this._container.elements(dbg, variable)) {
-            let v = new Variable(elStr, this._pointType);
-            const point = await this._point.load(dbg, v);
-            if (point === undefined)
-                return undefined;
-            const p = point as draw.Point;
-            xs.push(p.x)
-            ys.push(p.y);
-            system = p.system;
+        // Memory read
+        if (true) { // TODO: some check of value and container
+            for await (let elBuf of this._container.elementsHybrid(dbg, variable)) {
+                const el = await this._point.loadMem(dbg, elBuf);
+                if (el !== undefined) {
+                    const p = el as draw.Point;
+                    xs.push(p.x)
+                    ys.push(p.y);
+                    system = p.system;
+                }
+            }
+        }
+        // TODO: should probably check real error
+        if (xs.length == 0 || ys.length == 0)
+        {
+            for await (let elStr of this._container.elements(dbg, variable)) {
+                let v = new Variable(elStr, this._pointType);
+                const point = await this._point.load(dbg, v);
+                if (point === undefined)
+                    return undefined;
+                const p = point as draw.Point;
+                xs.push(p.x)
+                ys.push(p.y);
+                system = p.system;
+            }
         }
         return new draw.Plot(xs, ys, system);
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        const elStr = this._container.element(variable);
+        if (elStr === undefined)
+            return false;
+
+        // TODO - this is optional
+        await this._container.initMem(dbg, variable);
+
+        // TODO: check result of point's initMem before container initMem call?
+        const v = new Variable(elStr, this._pointType);
+        return this._point.initMem(dbg, v); // TODO - is returning Promise ok?
     }
 }
 
@@ -597,6 +880,45 @@ export class Point extends Geometry {
         }
         return new draw.Point(x, y, this._system);
     }
+
+    async loadMem(dbg: debug.Debugger, buffer: Buffer): Promise<draw.Drawable | undefined> {
+        let x = this._memory?.xNumericReader.read(buffer, this._memory.xOffset);
+        let y = this._memory?.yNumericReader.read(buffer, this._memory.yOffset);
+        if (x === undefined || y === undefined)
+            return undefined;
+        // Convert radians to degrees if needed
+        if (this._unit === Unit.Radian) {
+            const r2d = 180 / Math.PI;
+            x *= r2d;
+            y *= r2d;
+        }
+        return new draw.Point(x, y, this._system);
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        this._memory = undefined;
+        const sizeOf = await dbg.sizeOf(variable.name);
+        if (sizeOf === undefined)
+            return false;
+        const xStr = this._xEval.expression.toString(variable);
+        const yStr = this._yEval.expression.toString(variable);
+        if (xStr === undefined || yStr === undefined)
+            return false;
+        const xOffset = await dbg.addressOffset(variable.name, xStr);
+        const yOffset = await dbg.addressOffset(variable.name, yStr);
+        if (xOffset === undefined || yOffset === undefined)
+            return false;
+        if (xOffset < 0 || xOffset >= sizeOf || yOffset < 0 || yOffset >= sizeOf)
+            return false;
+        const xNumericReader = await debug.numericReader(dbg, xStr);
+        const yNumericReader = await debug.numericReader(dbg, yStr);
+        if (xNumericReader === undefined || yNumericReader === undefined)
+            return false;
+        this._memory = {sizeOf, xOffset: Number(xOffset).valueOf(), yOffset: Number(yOffset).valueOf(), xNumericReader, yNumericReader};
+        return true;
+    }
+
+    private _memory: {sizeOf: number; xOffset: number; yOffset: number; xNumericReader: debug.NumericReader; yNumericReader: debug.NumericReader;} | undefined = undefined;
 }
 
 export class PointsRange extends Geometry {
@@ -608,6 +930,12 @@ export class PointsRange extends Geometry {
         const contStr = this._containerExpr.expression.toString(variable);
         const contVar = new Variable(contStr, this._containerExpr.type);
         return this._pointsLoad.load(dbg, contVar);
+    }
+
+    async initMem(dbg: debug.Debugger, variable: Variable): Promise<boolean> {
+        const contStr = this._containerExpr.expression.toString(variable);
+        const contVar = new Variable(contStr, this._containerExpr.type);
+        return this._pointsLoad.initMem(dbg, contVar); // TODO - is returning Promise ok?
     }
 }
 
@@ -1245,7 +1573,7 @@ export async function getLoader(dbg: debug.Debugger,
                 else {
                     const contLoad: Container | undefined = await _getContainer(dbg, variable, entry.linestrings.container);
                     if (contLoad !== undefined)
-                        return await getElements(dbg, variable, contLoad, onlyLinestrings);
+                        return getElements(dbg, variable, contLoad, onlyLinestrings);
                 }
             }
         }
@@ -1263,7 +1591,7 @@ export async function getLoader(dbg: debug.Debugger,
                 else {
                     const contLoad: Container | undefined = await _getContainer(dbg, variable, entry.polygons.container);
                     if (contLoad !== undefined)
-                        return await getElements(dbg, variable, contLoad, onlyPolygons);
+                        return getElements(dbg, variable, contLoad, onlyPolygons);
                 }
             }
         }

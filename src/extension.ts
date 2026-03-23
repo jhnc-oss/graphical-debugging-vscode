@@ -15,6 +15,7 @@ async function handleVariable(dbg: Debugger, gwVariable: GraphicalWatchVariable)
 		let variable: load.Variable = new load.Variable(gwVariable.name, type);
 		let loader = await load.getLoader(dbg, variable);
 		if (loader !== undefined) {
+			await loader.initMem(dbg, variable);
 			const drawable = await loader.load(dbg, variable);
 			if (drawable !== undefined) {
 				return [origType, drawable.toPlotly(gwVariable.color)];
@@ -131,14 +132,14 @@ export function activate(context: vscode.ExtensionContext) {
 	
 	debugHelper.onStopped(async () => {
 		// TEST v
-		const language = debugHelper.language();
-		const machineInfo = await debugHelper.machineInfo();
-		if (language !== undefined)
-			console.log(language);
-		if (machineInfo) {
-			console.log('pointer size: ' + machineInfo.pointerSize.toString());
-			console.log(machineInfo.endianness === Endianness.Little ? 'little endian' : 'big endian');
-		}
+		// const language = debugHelper.language();
+		// const machineInfo = await debugHelper.machineInfo();
+		// if (language !== undefined)
+		// 	console.log(language);
+		// if (machineInfo) {
+		// 	console.log('pointer size: ' + machineInfo.pointerSize.toString());
+		// 	console.log(machineInfo.endianness === Endianness.Little ? 'little endian' : 'big endian');
+		// }
 		// TEST ^
 
 		if (graphicalWatch.variables.length > 0)
@@ -164,26 +165,26 @@ export function activate(context: vscode.ExtensionContext) {
 
 		// TEST v
 		//let expr2 = await debugHelper.evaluate("&arrd[0]");
-		let expr2 = await debugHelper.evaluate("arrd");
-		if (expr2 && expr2.memoryReference) {
-			let buffer = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 10240);
-			if (buffer) {
-				let bufferLength = buffer.length;
-				let a = buffer.readDoubleLE(0);
-				let b = buffer.readDoubleLE(8);
-				let c = buffer.readDoubleLE(16);
-				let d = buffer.readDoubleLE(24);
-			}
-			let numbers: number[] = [];
-			let buffer2 = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 8 * 4);
-			if (buffer2) {
-				for (let i = 0; i < 4; ++i) {
-					numbers.push(buffer2.readDoubleLE(i * 8));
-				}
-			}
-			let buffer3 = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 8);
-			let a = 10;
-		}
+		// let expr2 = await debugHelper.evaluate("arrd");
+		// if (expr2 && expr2.memoryReference) {
+		// 	let buffer = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 10240);
+		// 	if (buffer) {
+		// 		let bufferLength = buffer.length;
+		// 		let a = buffer.readDoubleLE(0);
+		// 		let b = buffer.readDoubleLE(8);
+		// 		let c = buffer.readDoubleLE(16);
+		// 		let d = buffer.readDoubleLE(24);
+		// 	}
+		// 	let numbers: number[] = [];
+		// 	let buffer2 = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 8 * 4);
+		// 	if (buffer2) {
+		// 		for (let i = 0; i < 4; ++i) {
+		// 			numbers.push(buffer2.readDoubleLE(i * 8));
+		// 		}
+		// 	}
+		// 	let buffer3 = await debugHelper.readMemoryBuffer(expr2.memoryReference, 0, 8);
+		// 	let a = 10;
+		// }
 		// TEST ^
 	});
 

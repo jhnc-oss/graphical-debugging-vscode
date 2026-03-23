@@ -396,10 +396,11 @@ export class Debugger {
         return undefined;
     }
 
-    async sizeOf(typeOrValue: string) : Promise<number | undefined> {
+    // Type may be unrecognized by the debugger
+    async sizeOf(variableName: string) : Promise<number | undefined> {
         let sizeStr = "";
         if (this.language() === Language.Cpp) {
-            const expr = await this.evaluate('sizeof(' + typeOrValue + ')');
+            const expr = await this.evaluate('sizeof(' + variableName + ')');
             if (expr === undefined || expr.type === undefined) {
                 return undefined;
             }
@@ -410,6 +411,32 @@ export class Debugger {
         }
         const val = parseInt(sizeStr);
         return Number.isNaN(val) ? undefined : val;
+    }
+
+    async addressStr(variableName: string) : Promise<string | undefined> {
+        if (this.language() === Language.Cpp) {
+            const expr = await this.evaluate('&(' + variableName + ')');
+            if (expr === undefined || expr.type === undefined) {
+                return undefined;
+            }
+            return expr.memoryReference;
+        }
+        else {
+            return undefined;
+        }
+    }
+
+    async address(variableName: string) : Promise<bigint | undefined> {
+        const str = await this.addressStr(variableName);
+        return str !== undefined ? BigInt(str) : undefined;
+    }
+
+    // An alternative in C++ evaluate ((char*)&variable2Name) - ((char*)&variable1Name)
+    async addressOffset(variable1Name: string, variable2Name: string) : Promise<bigint | undefined> {
+        
+        const addr1 = await this.address(variable1Name);
+        const addr2 = await this.address(variable2Name);
+        return addr1 !== undefined && addr2 !== undefined ? addr2 - addr1 : undefined;
     }
 
     async cppIsSignedInt(intType : string) : Promise<boolean | undefined> {
@@ -423,6 +450,23 @@ export class Debugger {
             return true;
         else
             return false;
+    }
+
+    // TODO should probably take variable name instead of type
+    isPointer(type : string) : boolean {
+        if (this.language() === Language.Cpp) {
+            return type.trimEnd().endsWith("*");
+        }
+        return false;
+    }
+
+    // TODO should probably take variable name instead of type
+    isArray(type : string) : boolean {
+        if (this.language() === Language.Cpp) {
+            // TODO: check closing bracket and size?
+            return type.indexOf("[") >= 0;
+        }
+        return false;
     }
 
     private sessionInfo: SessionInfo | undefined = undefined;
@@ -491,6 +535,8 @@ export class MachineInfo {
     }
 }
 
+// TODO: Move memory readers to separate module
+
 // TODO: or maybe return number | BigInt
 // TODO: check if Plotly can even take BigInt
 
@@ -540,6 +586,13 @@ export class UIntReader extends NumericReader {
     }
 }
 
+export class PointerReader {
+    constructor (private _machineInfo: MachineInfo) {}
+    read(buffer: Buffer, offset?: number) : bigint | undefined {
+        return this._machineInfo.readPointer(buffer, offset);
+    }
+}
+
 const cppSignedIntTypes = new Set<string>([
     // std
     'signed char',
@@ -579,6 +632,10 @@ const cppUnknownIntTypes = new Set<string>([
 ]);
 
 export async function numericReader(dbg: Debugger, expression: string) : Promise<NumericReader | undefined> {
+    if (dbg.language() !== Language.Cpp) {
+        return undefined;
+    }
+
     const mi = await dbg.machineInfo();
     if (mi === undefined) {
         return undefined;
@@ -587,27 +644,54 @@ export async function numericReader(dbg: Debugger, expression: string) : Promise
     if (type === undefined) {
         return undefined;
     }
-    if (dbg.language() === Language.Cpp) {
-        if (type === "double" || type === "long double" && await dbg.sizeOf(type) === 8) {
-            return new DoubleReader(mi);
-        }
-        else if (type === "float") {
-            return new FloatReader(mi);
-        }
-        else if (cppSignedIntTypes.has(type) || cppUnknownIntTypes.has(type) && await dbg.cppIsSignedInt(type) === true) {
-            const byteLength = await dbg.sizeOf(type);
-            if (byteLength === undefined || byteLength < 1 || byteLength > 8) {
-                return undefined;
-            }
-            return new IntReader(mi, byteLength);
-        }
-        else if (cppUnsignedIntTypes.has(type) || cppUnknownIntTypes.has(type) && await dbg.cppIsSignedInt(type) === false) {
-            const byteLength = await dbg.sizeOf(type);
-            if (byteLength === undefined || byteLength < 1 || byteLength > 8) {
-                return undefined;
-            }
-            return new UIntReader(mi, byteLength);
-        }
+    
+    // C++
+    if (type === "double" || type === "long double" && await dbg.sizeOf(type) === 8) {
+        return new DoubleReader(mi);
     }
+    else if (type === "float") {
+        return new FloatReader(mi);
+    }
+    else if (cppSignedIntTypes.has(type) || cppUnknownIntTypes.has(type) && await dbg.cppIsSignedInt(type) === true) {
+        const byteLength = await dbg.sizeOf(expression);
+        if (byteLength === undefined || byteLength < 1 || byteLength > 8) {
+            return undefined;
+        }
+        return new IntReader(mi, byteLength);
+    }
+    else if (cppUnsignedIntTypes.has(type) || cppUnknownIntTypes.has(type) && await dbg.cppIsSignedInt(type) === false) {
+        const byteLength = await dbg.sizeOf(expression);
+        if (byteLength === undefined || byteLength < 1 || byteLength > 8) {
+            return undefined;
+        }
+        return new UIntReader(mi, byteLength);
+    }
+
     return undefined;
+}
+
+export async function pointerReader(dbg: Debugger, expression: string) : Promise<PointerReader | undefined> {
+    if (dbg.language() !== Language.Cpp) {
+        return undefined;
+    }
+
+    const mi = await dbg.machineInfo();
+    if (mi === undefined) {
+        return undefined;
+    }
+    const type = await dbg.getType(expression);
+    if (type === undefined) {
+        return undefined;
+    }
+    if (!dbg.isPointer(type)) {
+        return undefined;
+    }
+
+    // C++
+    const sizeOf = await dbg.sizeOf(expression);
+    if (sizeOf !== 4 && sizeOf !== 8) {
+        return undefined;
+    }
+
+    return new PointerReader(mi);
 }
